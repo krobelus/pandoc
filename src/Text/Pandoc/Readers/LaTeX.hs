@@ -166,6 +166,7 @@ data LaTeXState = LaTeXState{ sOptions       :: ReaderOptions
                             , sLabels        :: M.Map String [Inline]
                             , sHasChapters   :: Bool
                             , sToggles       :: M.Map String Bool
+                            , sEscapeMode    :: EscapeMode
                             }
      deriving Show
 
@@ -186,7 +187,11 @@ defaultLaTeXState = LaTeXState{ sOptions       = def
                               , sLabels        = M.empty
                               , sHasChapters   = False
                               , sToggles       = M.empty
+                              , sEscapeMode    = NoEscaping
                               }
+
+data EscapeMode = NoEscaping | EscapeSpecialCharacters
+     deriving (Show, Eq)
 
 instance PandocMonad m => HasQuoteContext LaTeXState m where
   getQuoteContext = sQuoteContext <$> getState
@@ -242,12 +247,16 @@ withVerbatimMode parser = do
   return result
 
 rawLaTeXParser :: (PandocMonad m, HasMacros s, HasReaderOptions s)
-               => Bool -> LP m a -> LP m a -> ParserT String s m (a, String)
-rawLaTeXParser retokenize parser valParser = do
+               => Bool -> EscapeMode -> LP m a -> LP m a
+               -> ParserT String s m (a, String)
+rawLaTeXParser retokenize escapeMode parser valParser = do
   inp <- getInput
   let toks = tokenize "source" $ T.pack inp
   pstate <- getState
-  let lstate = def{ sOptions = extractReaderOptions pstate }
+  let lstate = def{
+    sOptions = extractReaderOptions pstate,
+    sEscapeMode = escapeMode
+  }
   let lstate' = lstate { sMacros = extractMacros pstate }
   let rawparser = (,) <$> withRaw valParser <*> getState
   res' <- lift $ runParserT (snd <$> withRaw parser) lstate "chunk" toks
@@ -285,8 +294,8 @@ rawLaTeXBlock :: (PandocMonad m, HasMacros s, HasReaderOptions s)
               => ParserT String s m String
 rawLaTeXBlock = do
   lookAhead (try (char '\\' >> letter))
-  snd <$> (rawLaTeXParser False macroDef blocks
-      <|> rawLaTeXParser True
+  snd <$> (rawLaTeXParser False EscapeSpecialCharacters macroDef blocks
+      <|> rawLaTeXParser True EscapeSpecialCharacters
            (environment <|> macroDef <|> blockCommand)
            (mconcat <$> (many (block <|> beginOrEndCommand))))
 
@@ -308,12 +317,13 @@ rawLaTeXInline :: (PandocMonad m, HasMacros s, HasReaderOptions s)
                => ParserT String s m String
 rawLaTeXInline = do
   lookAhead (try (char '\\' >> letter))
-  snd <$> rawLaTeXParser True (inlineEnvironment <|> inlineCommand') inlines
+  snd <$> rawLaTeXParser True EscapeSpecialCharacters
+         (inlineEnvironment <|> inlineCommand') inlines
 
 inlineCommand :: PandocMonad m => ParserT String ParserState m Inlines
 inlineCommand = do
   lookAhead (try (char '\\' >> letter))
-  fst <$> rawLaTeXParser True (inlineEnvironment <|> inlineCommand') inlines
+  fst <$> rawLaTeXParser True EscapeSpecialCharacters (inlineEnvironment <|> inlineCommand') inlines
 
 tokenize :: SourceName -> Text -> [Tok]
 tokenize sourcename = totoks (initialPos sourcename)
@@ -1891,9 +1901,13 @@ inline = (mempty <$ comment)
      <|> (guardEnabled Ext_literate_haskell *> symbol '|' *> doLHSverb)
      <|> (str . (:[]) <$> primEscape)
      <|> regularSymbol
-     <|> (do res <- symbolIn "#^'`\"[]&"
-             pos <- getPosition
+     <|> try (do
+             res <- symbolIn "#^'`\"[]&"
              let s = T.unpack (untoken res)
+             when (s == "&") $ do
+                  escapeMode <- sEscapeMode <$> getState
+                  guard $ escapeMode == EscapeSpecialCharacters
+             pos <- getPosition
              report $ ParsingUnescaped s pos
              return $ str s)
 
@@ -2629,19 +2643,10 @@ parseTableRow :: PandocMonad m
 parseTableRow envname prefsufs = do
   notFollowedBy (spaces *> end_ envname)
   let cols = length prefsufs
-  -- add prefixes and suffixes in token stream:
-  let celltoks (pref, suff) = do
-        prefpos <- getPosition
-        contents <- many (notFollowedBy
-                         (() <$ amp <|> () <$ lbreak <|> end_ envname)
-                         >> anyTok)
-        suffpos <- getPosition
-        option [] (count 1 amp)
-        return $ map (setpos prefpos) pref ++ contents ++ map (setpos suffpos) suff
-  rawcells <- mapM celltoks prefsufs
-  oldInput <- getInput
-  cells <- mapM (\ts -> setInput ts >> parseTableCell) rawcells
-  setInput oldInput
+  let cellAndAmp (_, _) = parseTableCell <* optional amp
+  cells_init <- mapM cellAndAmp (init prefsufs)
+  last_cell <- parseTableCell
+  let cells = cells_init ++ [last_cell]
   spaces
   let numcells = length cells
   guard $ numcells <= cols && numcells >= 1
